@@ -6,6 +6,16 @@ import embodied
 def load_env(
     task, amount=1, parallel='none', restart=False, seed=None, **kwargs):
   ctors = []
+
+  if task == 'a1_walk':
+    from . import a1
+    env = a1.A1()
+    # env = load_single_env(task, **kwargs)
+    for name, space in env.act_space.items():
+      if not space.discrete:
+        env = embodied.wrappers.ClipAction(env, name)
+    return env
+
   for index in range(amount):
     ctor = functools.partial(load_single_env, task, **kwargs)
     if seed is not None:
@@ -85,6 +95,9 @@ def load_single_env(
   elif suite == 'dmc':
     from . import dmc
     env = dmc.DMC(task, repeat, render=True, size=size, camera=camera)
+  elif suite == 'a1':
+    from . import a1
+    env = a1.A1()
   elif suite == 'metaworld':
     from . import metaworld
     env = metaworld.MetaWorld(

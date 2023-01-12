@@ -246,6 +246,11 @@ dmc_proprio:
   encoder: {mlp_keys: '.*', cnn_keys: '$^'}
   decoder: {mlp_keys: '.*', cnn_keys: '$^'}
 
+dmc_vision_masked:
+
+  encoder: {mlp_keys: '.*', cnn_keys: '$^'}
+  decoder: {mlp_keys: '.*', cnn_keys: 'image'}
+
 metaworld:
 
   task: metaworld_peg_insert_side
@@ -282,6 +287,19 @@ loconav_ant:
     log_keys_max: '^log_.*'
   encoder: {mlp_keys: '.*', cnn_keys: 'image'}
   decoder: {mlp_keys: '.*', cnn_keys: 'image'}
+
+a1:
+
+  task: a1_walk
+  env.amount: 8
+  env.repeat: 1
+  env.length: 0
+  run:
+    log_keys_max: '^log_.*'
+    log_keys_mean: '^log_.*'
+  # rssm.deter: 2048  # For dynamics backprop to fit into VRAM.
+  encoder: {mlp_keys: '.*', cnn_keys: '$^'}
+  decoder: {mlp_keys: '.*', cnn_keys: '$^'}
 
 hrlgrid:
 
