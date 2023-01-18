@@ -39,25 +39,23 @@ def parse_sim_params(cfg_sim):
     return sim_params, 'cuda:0'
 
 
-def unnormalize_action_torch(action, dof_pos_low, dof_pos_high, motor_offsets, motor_used, clip=True):
+def unnormalize_action_torch(action, dof_pos_low, dof_pos_high, motor_used_low, motor_used_high, clip=True):
   if clip:
-    action = torch.clamp(action, -1, 1)
+    action = torch.clip(action, -1, 1)
   action = action / 2 + 0.5
-  lo = dof_pos_low * (1 - motor_used[:, 0]) + dof_pos_high * motor_used[:, 0]
-  hi = dof_pos_low * (1 - motor_used[:, 1]) + dof_pos_high * motor_used[:, 1]
+  lo = dof_pos_low * (1 - motor_used_low) + dof_pos_high * motor_used_low
+  hi = dof_pos_low * (1 - motor_used_high) + dof_pos_high * motor_used_high
   action = action * (hi - lo) + lo
-  action += motor_offsets 
   return action
 
 
-def normalize_action_torch(action, dof_pos_low, dof_pos_high, motor_offsets, motor_used, clip=True):
-  action -= motor_offsets 
-  lo = dof_pos_low * (1 - motor_used[:, 0]) + dof_pos_high * motor_used[:, 0]
-  hi = dof_pos_low * (1 - motor_used[:, 1]) + dof_pos_high * motor_used[:, 1]
+def normalize_action_torch(action, dof_pos_low, dof_pos_high, motor_used_low, motor_used_high, clip=True):
+  lo = dof_pos_low * (1 - motor_used_low) + dof_pos_high * motor_used_low
+  hi = dof_pos_low * (1 - motor_used_high) + dof_pos_high * motor_used_high
   action = (action - lo) / (hi - lo)
   action = (action - 0.5) * 2
   if clip:
-    action = torch.clamp(action, -1, 1)
+    action = torch.clip(action, -1, 1)
   return action
 
 
@@ -66,7 +64,7 @@ class A1(embodied.Env):
     config = yaml.YAML(typ='safe').load(
       (embodied.Path(__file__).parent / 'a1_config.yaml').read())
 
-    def __init__(self):
+    def __init__(self, num_envs, decimation, resets, gray):
         """ Parses the provided config file,
             calls create_sim() (which creates, simulation, terrain and environments),
             initilizes pytorch buffers used during training
@@ -76,6 +74,9 @@ class A1(embodied.Env):
         self.height_samples = None
         self.debug_viz = False
         self.init_done = False
+        self.decimation = decimation
+        self.resets = resets
+        self.gray = gray
         self._parse_cfg(self.cfg)
 
         self.gym = gymapi.acquire_gym()
@@ -90,25 +91,12 @@ class A1(embodied.Env):
         else:
             self.device = 'cpu'
 
-        self.motor_offsets = torch.tensor([
-            0.0, 0.0, 0.0,
-            0.0, 0.0, 0.0,
-            0.0, 0.0, 0.0,
-            0.0, 0.0, 0.0,
-        ], device=self.device)
-
-        self.motor_used = torch.tensor([
-            [0.01, 0.99],
-            [0.2, 0.60],
-            [0.2, 0.60],
-        ] * 4, device=self.device)
-
         # graphics device for rendering, -1 for no rendering
         self.graphics_device_id = self.sim_device_id
-        if self.headless == True:
+        if self.headless == True and not self.cfg.depth.capture_images:
             self.graphics_device_id = -1
 
-        self.num_envs = self.cfg.env.num_envs
+        self.num_envs = num_envs
         self.num_actions = self.cfg.env.num_actions
 
         # optimization flags for pytorch JIT
@@ -157,13 +145,12 @@ class A1(embodied.Env):
         # convention, keys starting with log_ are not consumed by the agent.
 
         obs_space = {
-            'base_lin_vel': embodied.Space(np.float32, (3,)),
-            'base_ang_vel': embodied.Space(np.float32, (3,)),
-            'projected_gravity': embodied.Space(np.float32, (3,)),
+            'obs_base_lin_vel': embodied.Space(np.float32, (3,)),
+            'obs_base_ang_vel': embodied.Space(np.float32, (3,)),
+            'obs_projected_gravity': embodied.Space(np.float32, (3,)),
             'commands': embodied.Space(np.float32, (3,)),
-            'dof_pos': embodied.Space(np.float32, (12,)),
-            'dof_vel': embodied.Space(np.float32, (12,)),
-            'actions': embodied.Space(np.float32, (12,)),
+            'obs_dof_pos': embodied.Space(np.float32, (12,)),
+            'obs_dof_vel': embodied.Space(np.float32, (12,)),
             'reward': embodied.Space(np.float32),
             'is_first': embodied.Space(bool),
             'is_last': embodied.Space(bool),
@@ -171,7 +158,11 @@ class A1(embodied.Env):
         }
         # add perceptive inputs if not blind
         if self.cfg.terrain.measure_heights:
-            obs_space['heights'] = embodied.Space(np.float32, (len(self.cfg.terrain.measured_points_x) * len(self.cfg.terrain.measured_points_y),))
+            obs_space['image_heights'] = embodied.Space(np.uint8, (len(self.cfg.terrain.measured_points_x), len(self.cfg.terrain.measured_points_y), 1))
+
+        if self.cfg.depth.capture_images:
+            obs_space['image'] = embodied.Space(np.uint8, (self.cfg.depth.original[0], self.cfg.depth.original[1],
+                                                           3 if not self.gray else 1))
 
         return obs_space
 
@@ -188,33 +179,40 @@ class A1(embodied.Env):
         Args:
             actions (torch.Tensor): Tensor of shape (num_envs, num_actions_per_env)
         """
-        is_first = torch.clone(self.reset_buf)
+        is_first = torch.tensor(actions['reset']).type(torch.bool).to(self.device)
 
         actions = torch.tensor(actions['action'].astype(np.float32)).to(self.device)
-        self.actions = unnormalize_action_torch(
+        self.actions[:] = unnormalize_action_torch(
             actions, self.dof_pos_limits[:, 0], self.dof_pos_limits[:, 1],
-            self.motor_offsets, self.motor_used)
+            self.motor_used_low, self.motor_used_high)
 
         # step physics and render each frame
         self.render()
-        for _ in range(self.cfg.control.decimation):
+        for _ in range(self.decimation):
             self.torques = self._compute_torques(self.actions).view(self.torques.shape)
             self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self.torques))
             self.gym.simulate(self.sim)
-            if self.device == 'cpu':
-                self.gym.fetch_results(self.sim, True)
+            # if self.device == 'cpu':
+            self.gym.fetch_results(self.sim, True)
             self.gym.refresh_dof_state_tensor(self.sim)
         observations, rewards = self.post_physics_step()
 
+        np_observations = {}
         for k, v in observations.items():
-            observations[k] = v.detach().cpu().numpy()
+            np_observations[k] = v.detach().cpu().numpy()
 
-
-        observations['reward'] = ((1.0 - is_first.type(torch.float32)) * rewards).type(torch.float32).detach().cpu().numpy()
-        observations['is_first'] = is_first.type(torch.bool).detach().cpu().numpy()
-        observations['is_last'] = self.reset_buf.type(torch.bool).detach().cpu().numpy()
-        observations['is_terminal'] = self.reset_buf.type(torch.bool).detach().cpu().numpy()
-        return observations
+        if self.resets:
+            np_observations['reward'] = ((1.0 - self.reset_buf.type(torch.float32)) * rewards).type(torch.float32).detach().cpu().numpy()
+            np_observations['is_first'] = is_first.type(torch.bool).detach().cpu().numpy()
+            np_observations['is_last'] = self.reset_buf.type(torch.bool).detach().cpu().numpy()
+            np_observations['is_terminal'] = self.reset_buf.type(torch.bool).detach().cpu().numpy()
+        else:
+            np_observations['reward'] = rewards.detach().cpu().numpy()
+            np_observations['is_first'] = is_first.type(torch.bool).detach().cpu().numpy()
+            np_observations['is_last'] = self.reset_buf.type(torch.bool).detach().cpu().numpy()
+            np_observations['is_terminal'] = torch.zeros_like(self.reset_buf).type(torch.bool).detach().cpu().numpy()
+            
+        return np_observations
 
     def reset(self):
         """ Reset all robots"""
@@ -246,7 +244,14 @@ class A1(embodied.Env):
         self.check_termination()
         rewards, log_rewards = self.compute_reward()
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
-        log_obs = self.reset_idx(env_ids)
+        if self.resets:
+            log_obs = self.reset_idx(env_ids)
+        else:
+            if self.cfg.commands.curriculum and (self.common_step_counter % self.max_episode_length==0):
+                self.update_command_curriculum(env_ids)
+            self._resample_commands(env_ids)
+            log_obs = None
+            self.episode_length_buf[env_ids] = 0
         observations = self.compute_observations() # in some cases a simulation step might be required to refresh some obs (for example body positions)
         if log_obs is not None:
             observations.update(log_obs)
@@ -264,9 +269,12 @@ class A1(embodied.Env):
     def check_termination(self):
         """ Check if environments need to be reset
         """
-        self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
-        self.time_out_buf = self.episode_length_buf > self.max_episode_length # no terminal reward for time-outs
-        self.reset_buf |= self.time_out_buf
+        if not self.resets:
+            self.reset_buf = self.episode_length_buf > self.max_episode_length # no terminal reward for time-outs
+        else:
+            self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
+            self.time_out_buf = self.episode_length_buf > self.max_episode_length # no terminal reward for time-outs
+            self.reset_buf |= self.time_out_buf
 
     def reset_idx(self, env_ids):
         """ Reset some environments.
@@ -281,7 +289,7 @@ class A1(embodied.Env):
         if len(env_ids) == 0:
             return
         # update curriculum
-        if self.cfg.terrain.curriculum:
+        if self.curriculum:
             self._update_terrain_curriculum(env_ids)
         # avoid updating command curriculum at each step since the maximum command is common to all envs
         if self.cfg.commands.curriculum and (self.common_step_counter % self.max_episode_length==0):
@@ -324,14 +332,14 @@ class A1(embodied.Env):
             name = self.reward_names[i]
             rew = self.reward_functions[i]() * self.reward_scales[name]
             log_rewards["log_step_rew_" + name] = rew
-            rewards += rew
+            rewards[:] += rew
             self.episode_sums[name] += rew
         if self.cfg.rewards.only_positive_rewards:
             rewards[:] = torch.clip(rewards[:], min=0.)
         # add termination reward after clipping
         if "termination" in self.reward_scales:
             rew = self._reward_termination() * self.reward_scales["termination"]
-            rewards += rew
+            rewards[:] += rew
             self.episode_sums["termination"] += rew
 
         return rewards, log_rewards
@@ -341,24 +349,36 @@ class A1(embodied.Env):
         """
 
         obs_dict = {
-            'base_lin_vel': self.base_lin_vel * self.obs_scales.lin_vel,
-            'base_ang_vel': self.base_ang_vel * self.obs_scales.ang_vel,
-            'projected_gravity': self.projected_gravity,
-            'commands': self.commands[:, :3] * self.commands_scale,
-            'dof_pos': (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
-            'dof_vel': self.dof_vel * self.obs_scales.dof_vel,
-            'actions': normalize_action_torch(
-                self.actions,
-                self.dof_pos_limits[:, 0],
-                self.dof_pos_limits[:, 1],
-                self.motor_offsets,
-                self.motor_used),
+            'obs_base_lin_vel': self.base_lin_vel * self.obs_scales.lin_vel,
+            'obs_base_ang_vel': self.base_ang_vel * self.obs_scales.ang_vel,
+            'obs_projected_gravity': self.projected_gravity,
+            'commands': self.commands[..., :3] * self.commands_scale,
+            'obs_dof_pos': (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
+            'obs_dof_vel': self.dof_vel * self.obs_scales.dof_vel,
+            # 'actions': normalize_action_torch(
+            #     self.actions,
+            #     self.dof_pos_limits[:, 0],
+            #     self.dof_pos_limits[:, 1],
+            #     self.motor_offsets,
+            #     self.motor_used),
         }        
+        for k, v in obs_dict.items():
+            obs_dict[k] = torch.clip(
+                v,
+                -self.cfg.normalization.clip_observations,
+                self.cfg.normalization.clip_observations)
 
         # add perceptive inputs if not blind
         if self.cfg.terrain.measure_heights:
             heights = torch.clip(self.root_states[:, 2].unsqueeze(1) - 0.5 - self.measured_heights, -1, 1.) * self.obs_scales.height_measurements
-            obs_dict['heights'] = heights
+            heights = (heights + 1.) / 2.
+            heights = heights.view(self.num_envs, len(self.cfg.terrain.measured_points_x), len(self.cfg.terrain.measured_points_y), 1)
+            heights = torch.round(heights * 255.).to(torch.uint8)
+            obs_dict['image_heights'] = heights
+
+        if self.cfg.depth.capture_images:
+            obs_dict['image'] = self.images
+
         # add noise if needed
         if self.add_noise:
             for key in self.noise_scale_dict.keys():
@@ -463,8 +483,8 @@ class A1(embodied.Env):
             Default behaviour: Compute ang vel command based on target and heading, compute measured terrain heights and randomly push robots
         """
         # 
-        env_ids = (self.episode_length_buf % int(self.cfg.commands.resampling_time / self.dt)==0).nonzero(as_tuple=False).flatten()
-        self._resample_commands(env_ids)
+        # env_ids = (self.episode_length_buf % int(self.cfg.commands.resampling_time / self.dt)==0).nonzero(as_tuple=False).flatten()
+        # self._resample_commands(env_ids)
         if self.cfg.commands.heading_command:
             forward = quat_apply(self.base_quat, self.forward_vec)
             heading = torch.atan2(forward[:, 1], forward[:, 0])
@@ -472,6 +492,8 @@ class A1(embodied.Env):
 
         if self.cfg.terrain.measure_heights:
             self.measured_heights = self._get_heights()
+        if self.cfg.depth.capture_images:
+            self.images = self._get_images()
         if self.cfg.domain_rand.push_robots and  (self.common_step_counter % self.push_interval == 0):
             self._push_robots()
 
@@ -663,13 +685,18 @@ class A1(embodied.Env):
         if self.cfg.terrain.measure_heights:
             self.height_points = self._init_height_points()
         self.measured_heights = 0
+        self.images = 0
 
         # joint positions offsets and PD gains
         self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
+        self.motor_used_low = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
+        self.motor_used_high = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
         for i in range(self.num_dofs):
             name = self.dof_names[i]
             angle = self.cfg.init_state.default_joint_angles[name]
             self.default_dof_pos[i] = angle
+            self.motor_used_low[i] = self.cfg.init_state.motor_used[name][0]
+            self.motor_used_high[i] = self.cfg.init_state.motor_used[name][1]
             found = False
             for dof_name in self.cfg.control.stiffness.keys():
                 if dof_name in name:
@@ -682,6 +709,8 @@ class A1(embodied.Env):
                 if self.cfg.control.control_type in ["P", "V"]:
                     print(f"PD gain of joint {name} were not defined, setting them to zero")
         self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
+        self.motor_used_low = self.motor_used_low.unsqueeze(0)
+        self.motor_used_high = self.motor_used_high.unsqueeze(0)
 
     def _prepare_reward_function(self):
         """ Prepares a list of reward functions, whcih will be called to compute the total reward.
@@ -809,6 +838,8 @@ class A1(embodied.Env):
         self._get_env_origins()
         env_lower = gymapi.Vec3(0., 0., 0.)
         env_upper = gymapi.Vec3(0., 0., 0.)
+        self.cam_handles = []
+        # self.cam_params = []
         self.actor_handles = []
         self.envs = []
         for i in range(self.num_envs):
@@ -816,8 +847,8 @@ class A1(embodied.Env):
             env_handle = self.gym.create_env(self.sim, env_lower, env_upper, int(np.sqrt(self.num_envs)))
             pos = self.env_origins[i].clone()
             pos[:2] += torch_rand_float(-1., 1., (2,1), device=self.device).squeeze(1)
-            start_pose.p = gymapi.Vec3(*pos)
-                
+            start_pose.p = gymapi.Vec3(*pos)                
+
             rigid_shape_props = self._process_rigid_shape_props(rigid_shape_props_asset, i)
             self.gym.set_asset_rigid_shape_properties(robot_asset, rigid_shape_props)
             actor_handle = self.gym.create_actor(env_handle, robot_asset, start_pose, self.cfg.asset.name, i, self.cfg.asset.self_collisions, 0)
@@ -828,6 +859,23 @@ class A1(embodied.Env):
             self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
             self.envs.append(env_handle)
             self.actor_handles.append(actor_handle)
+
+            if self.cfg.depth.capture_images:
+                camera_props = gymapi.CameraProperties()
+                camera_props.width = self.cfg.depth.original[0]
+                camera_props.height = self.cfg.depth.original[1]
+                camera_props.horizontal_fov = self.cfg.depth.horizontal_fov
+                camera_props.enable_tensors = True
+                
+                camera_handle = self.gym.create_camera_sensor(env_handle, camera_props)
+                self.cam_handles.append(camera_handle)
+                
+                local_transform = gymapi.Transform()
+                local_transform.p = gymapi.Vec3(0.50, 0, 1.2)
+                local_transform.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(0,1,0), np.radians(90))
+                root_handle = self.gym.get_actor_root_rigid_body_handle(env_handle, actor_handle)
+                
+                self.gym.attach_camera_to_body(camera_handle, env_handle, root_handle, local_transform, gymapi.FOLLOW_TRANSFORM)
 
         self.feet_indices = torch.zeros(len(feet_names), dtype=torch.long, device=self.device, requires_grad=False)
         for i in range(len(feet_names)):
@@ -850,7 +898,7 @@ class A1(embodied.Env):
             self.env_origins = torch.zeros(self.num_envs, 3, device=self.device, requires_grad=False)
             # put robots at the origins defined by the terrain
             max_init_level = self.cfg.terrain.max_init_terrain_level
-            if not self.cfg.terrain.curriculum: max_init_level = self.cfg.terrain.num_rows - 1
+            if not self.curriculum: max_init_level = self.cfg.terrain.num_rows - 1
             self.terrain_levels = torch.randint(0, max_init_level+1, (self.num_envs,), device=self.device)
             self.terrain_types = torch.div(torch.arange(self.num_envs, device=self.device), (self.num_envs/self.cfg.terrain.num_cols), rounding_mode='floor').to(torch.long)
             self.max_terrain_level = self.cfg.terrain.num_rows
@@ -869,15 +917,14 @@ class A1(embodied.Env):
             self.env_origins[:, 2] = 0.
 
     def _parse_cfg(self, cfg):
-        self.dt = self.cfg.control.decimation * self.sim_params.dt
+        self.dt = self.decimation * self.sim_params.dt
         self.obs_scales = self.cfg.normalization.obs_scales
         self.reward_scales = dict(self.cfg.rewards.scales)
         self.command_ranges = dict(self.cfg.commands.ranges)
         if self.cfg.terrain.mesh_type not in ['heightfield', 'trimesh']:
-            self.cfg.terrain.curriculum = False
+            self.curriculum = False
         self.max_episode_length_s = self.cfg.env.episode_length_s
         self.max_episode_length = np.ceil(self.max_episode_length_s / self.dt)
-
         self.push_interval = np.ceil(self.cfg.domain_rand.push_interval_s / self.dt)
 
     def _draw_debug_vis(self):
@@ -955,6 +1002,32 @@ class A1(embodied.Env):
 
         return heights.view(self.num_envs, -1) * self.terrain.cfg.vertical_scale
 
+    def _get_images(self):
+        self.gym.render_all_camera_sensors(self.sim)
+        self.gym.start_access_image_tensors(self.sim)
+        images = []
+        for i, cam_handle in enumerate(self.cam_handles):
+            cam_pos = np.array(self.root_states[i, :3].cpu()) + np.array(
+                [0.65, 0.65, 0.3])
+            cam_pos = gymapi.Vec3(cam_pos[0], cam_pos[1], cam_pos[2])
+            cam_target = np.array(self.root_states[i, :3].cpu())
+            cam_target = gymapi.Vec3(cam_target[0], cam_target[1],
+                                     cam_target[2])
+            self.gym.set_camera_location(cam_handle, self.envs[i], cam_pos, cam_target)
+
+            image = gymtorch.wrap_tensor(self.gym.get_camera_image_gpu_tensor(
+                self.sim, self.envs[i], cam_handle, gymapi.IMAGE_COLOR))
+            images.append(image)
+        images_rgb = torch.stack(images, dim=0)[..., :-1]
+        self.gym.end_access_image_tensors(self.sim)
+        if self.gray:
+            gray = 0.2989 * images_rgb[..., 0] + 0.5870 * images_rgb[..., 1] + 0.1140 * images_rgb[..., 2]
+            gray = gray.type(torch.uint8)
+            gray = gray.unsqueeze(-1)
+            return gray
+        else:
+            return images_rgb
+
     def render(self, sync_frame_time=True):
         if self.viewer:
             # check for window closed
@@ -981,6 +1054,9 @@ class A1(embodied.Env):
             else:
                 self.gym.poll_viewer_events(self.viewer)
 
+        if self.cfg.depth.capture_images:
+            self.gym.step_graphics(self.sim)
+
     #------------ reward functions----------------
     def _reward_lin_vel_z(self):
         # Penalize z axis base linear velocity
@@ -997,7 +1073,8 @@ class A1(embodied.Env):
     def _reward_base_height(self):
         # Penalize base height away from target
         base_height = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1)
-        return torch.square(base_height - self.cfg.rewards.base_height_target)
+        base_height_error = torch.square(base_height - self.cfg.rewards.base_height_target)
+        return torch.exp(-base_height_error/self.cfg.rewards.base_height_sigma)
     
     def _reward_torques(self):
         # Penalize torques
@@ -1013,7 +1090,9 @@ class A1(embodied.Env):
     
     def _reward_action_rate(self):
         # Penalize changes in actions
-        return torch.sum(torch.square(self.last_actions - self.actions), dim=1)
+        last_actions = normalize_action_torch(self.last_actions, self.dof_pos_limits[:, 0], self.dof_pos_limits[:, 1], self.motor_used_low, self.motor_used_high)
+        actions = normalize_action_torch(self.actions, self.dof_pos_limits[:, 0], self.dof_pos_limits[:, 1], self.motor_used_low, self.motor_used_high)
+        return torch.sum(torch.square(last_actions - actions), dim=1)
     
     def _reward_collision(self):
         # Penalize collisions on selected bodies
@@ -1067,9 +1146,36 @@ class A1(embodied.Env):
              5 *torch.abs(self.contact_forces[:, self.feet_indices, 2]), dim=1)
         
     def _reward_stand_still(self):
+        curr_pos = normalize_action_torch(self.dof_pos, self.dof_pos_limits[:, 0], self.dof_pos_limits[:, 1], self.motor_used_low, self.motor_used_high)
+        default_pos = normalize_action_torch(self.default_dof_pos, self.dof_pos_limits[:, 0], self.dof_pos_limits[:, 1], self.motor_used_low, self.motor_used_high)
         # Penalize motion at zero commands
-        return torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1) * (torch.norm(self.commands[:, :2], dim=1) < 0.1)
+        return torch.sum(torch.abs(curr_pos - default_pos), dim=1) * (torch.norm(self.commands[:, :2], dim=1) < 0.1)
 
     def _reward_feet_contact_forces(self):
         # penalize high contact forces
         return torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) -  self.cfg.rewards.max_contact_force).clip(min=0.), dim=1)
+
+    def _reward_daydreamer(self):
+        curr_pos = normalize_action_torch(self.dof_pos, self.dof_pos_limits[:, 0], self.dof_pos_limits[:, 1], self.motor_used_low, self.motor_used_high)
+        default_pos = normalize_action_torch(self.default_dof_pos, self.dof_pos_limits[:, 0], self.dof_pos_limits[:, 1], self.motor_used_low, self.motor_used_high)
+        deviations = torch.abs(curr_pos - default_pos)
+        worst = torch.maximum(1 - default_pos, 1 + default_pos)
+        deviations = torch.clip(deviations / worst, 0, 1)  # Map to [0, 1]
+        r_upr = -1 * self.projected_gravity[:, -1]
+        r_upr = r_upr / 2 + 0.5
+        r_hip = (r_upr > 0.7) * (1 - deviations[..., 0::3].mean(dim=-1))
+        r_sho = (r_hip > 0.7) * (1 - deviations[..., 1::3].mean(dim=-1))
+        r_kne = (r_sho > 0.7) * (1 - deviations[..., 2::3].mean(dim=-1))
+
+        forward_vel = self.base_lin_vel[..., 0]
+        total_vel = torch.norm(self.base_lin_vel, dim=-1)
+        forward_frac = torch.maximum(torch.zeros_like(forward_vel), forward_vel) / total_vel
+        forward_going = torch.clip(forward_vel / 0.3, -1, 1)
+        r_vel = (r_kne > 0.7) * forward_frac * forward_going
+
+        return r_upr + r_hip + r_sho + r_kne + 10 * (r_vel + 1) / 2
+
+    def _reward_upright(self):
+        upr = -1 * self.projected_gravity[:, -1]
+        upr = (upr + 1.) / 2.
+        return upr

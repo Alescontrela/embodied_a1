@@ -292,14 +292,20 @@ a1:
 
   task: a1_walk
   env.amount: 8
-  env.repeat: 1
-  env.length: 0
+  env.repeat: 6
+  env.resets: False
+  env.gray: True
+  rssm.deter: 512
+  .*\.cnn_depth: 32
+  .*\.layers: 2
+  .*\.units: 512
   run:
     log_keys_max: '^log_.*'
     log_keys_mean: '^log_.*'
-  # rssm.deter: 2048  # For dynamics backprop to fit into VRAM.
-  encoder: {mlp_keys: '.*', cnn_keys: '$^'}
-  decoder: {mlp_keys: '.*', cnn_keys: '$^'}
+    log_keys_video: [image, image_heights]
+    train_ratio: 32
+  encoder: {mlp_keys: '.*', cnn_keys: '.*'}
+  decoder: {mlp_keys: '.*', cnn_keys: '.*'}
 
 hrlgrid:
 

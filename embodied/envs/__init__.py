@@ -9,11 +9,12 @@ def load_env(
 
   if task == 'a1_walk':
     from . import a1
-    env = a1.A1()
+    env = a1.A1(num_envs=amount, decimation=kwargs['repeat'], resets=kwargs['resets'], gray=kwargs['gray'])
     # env = load_single_env(task, **kwargs)
     for name, space in env.act_space.items():
       if not space.discrete:
         env = embodied.wrappers.ClipAction(env, name)
+        env = embodied.wrappers.NormalizeAction(env, name)
     return env
 
   for index in range(amount):
