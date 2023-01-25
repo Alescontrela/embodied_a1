@@ -1,11 +1,11 @@
 # used to create the object
 name: ShadowHand
 
-physics_engine: ${..physics_engine}
+physics_engine: physx
 
 # if given, will override the device setting in gym.
 env: 
-  numEnvs: ${resolve_default:16384,${...num_envs}}
+  numEnvs: 16384
   envSpacing: 0.75
   episodeLength: 600
   enableDebugVis: False
@@ -172,16 +172,16 @@ sim:
   dt: 0.01667 # 1/60
   substeps: 2
   up_axis: "z"
-  use_gpu_pipeline: ${eq:${...pipeline},"gpu"}
+  use_gpu_pipeline: True
   gravity: [0.0, 0.0, -9.81]
   physx:
-    num_threads: ${....num_threads}
-    solver_type: ${....solver_type}
-    use_gpu: ${contains:"cuda",${....sim_device}} # set to False to run on CPU
+    num_threads: 4
+    solver_type: 1
+    use_gpu: True # set to False to run on CPU
     num_position_iterations: 8
     num_velocity_iterations: 0
     max_gpu_contact_pairs: 8388608 # 8*1024*1024
-    num_subscenes: ${....num_subscenes}
+    num_subscenes: 4
     contact_offset: 0.002
     rest_offset: 0.0
     bounce_threshold_velocity: 0.2 

@@ -11,26 +11,46 @@ from isaacgym.torch_utils import *
 
 from isaacgymenvs.utils.torch_jit_utils import *
 from isaacgymenvs.tasks.base.vec_task import VecTask
+from omegaconf import DictConfig, OmegaConf
+from isaacgymenvs.utils.reformat import omegaconf_to_dict, print_dict
+
 
 import os
 import torch
 
+EXISTING_SIM = None
+SCREEN_CAPTURE_RESOLUTION = (1027, 768)
+
 def normalize_action_torch(action, dof_pos_low, dof_pos_high, clip=True):
     lo = dof_pos_low
     hi = dof_pos_high
+    print("LO SHAPE", lo.shape)
     action = (action - lo) / (hi - lo)
     action = (action - 0.5) * 2
     if clip:
         action = torch.clip(action, -1, 1)
     return action
 
+def _create_sim_once(gym, *args, **kwargs):
+    global EXISTING_SIM
+    if EXISTING_SIM is not None:
+        return EXISTING_SIM
+    else:
+        EXISTING_SIM = gym.create_sim(*args, **kwargs)
+        return EXISTING_SIM
+
 
 class ShadowHand(embodied.Env):
     config = yaml.YAML(typ='safe').load(
       (embodied.Path(__file__).parent / 'shadow_hand.yaml').read())
 
-    def __init__(self, sim_device, graphics_device_id, headless=True, virtual_screen_capture=False, force_render=False):
-        self.cfg = ShadowHand.config
+    def __init__(self, rl_device, sim_device, graphics_device_id, headless=True, virtual_screen_capture=False, force_render=False):
+        # self.cfg = ShadowHand.config
+        self.cfg = omegaconf_to_dict(ShadowHand.config)
+        # cfg_dict = omegaconf_to_dict(cfg)
+        print()
+        print("config", self.cfg)
+        print()
 
         self.randomize = self.cfg["task"]["randomize"]
         self.randomization_params = self.cfg["task"]["randomization_params"]
@@ -44,7 +64,8 @@ class ShadowHand(embodied.Env):
         self.fall_dist = self.cfg["env"]["fallDistance"]
         self.fall_penalty = self.cfg["env"]["fallPenalty"]
         self.rot_eps = self.cfg["env"]["rotEps"]
-        self.num_env = self.cfg["env"]["numEnvs"]
+        self.num_envs = self.cfg["env"]["numEnvs"]
+        print()
 
 
         self.vel_obs_scale = 0.2  # scale factor of velocity based observations
@@ -148,7 +169,7 @@ class ShadowHand(embodied.Env):
                 print("GPU Pipeline can only be used with GPU simulation. Forcing CPU Pipeline.")
                 self.cfg["sim"]["use_gpu_pipeline"] = False
 
-        # self.rl_device = rl_device
+        self.rl_device = rl_device
 
         # Rendering
         # if training in a headless mode
@@ -253,7 +274,7 @@ class ShadowHand(embodied.Env):
         self.shadow_hand_dof_vel = self.shadow_hand_dof_state[..., 1]
 
         self.rigid_body_states = gymtorch.wrap_tensor(rigid_body_tensor).view(self.num_envs, -1, 13)
-        print("rigid body states: ", type(self.rigid_body_states))
+        # print("rigid body states: ", type(self.rigid_body_states))
         self.num_bodies = self.rigid_body_states.shape[1]
 
         self.root_state_tensor = gymtorch.wrap_tensor(actor_root_state_tensor).view(-1, 13)
@@ -293,15 +314,28 @@ class ShadowHand(embodied.Env):
         self.dt = self.cfg["sim"]["dt"]
         self.up_axis_idx = 2 if self.up_axis == 'z' else 1 # index of up axis: Y=1, Z=2
 
-        self.sim = VecTask.create_sim(self.device_id, self.graphics_device_id, self.physics_engine, self.sim_params)
+        """Create an Isaac Gym sim object.
+
+        Args:
+            compute_device: ID of compute device to use.
+            graphics_device: ID of graphics device to use.
+            physics_engine: physics engine to use (`gymapi.SIM_PHYSX` or `gymapi.SIM_FLEX`)
+            sim_params: sim params to use.
+        Returns:
+            the Isaac Gym sim object.
+        """
+        _sim = _create_sim_once(self.gym, self.device_id, self.graphics_device_id, self.physics_engine, self.sim_params)
+        if _sim is None:
+            print("*** Failed to create sim")
+            quit()
+
+        self.sim = _sim
         self._create_ground_plane()
         self._create_envs(self.num_envs, self.cfg["env"]['envSpacing'], int(np.sqrt(self.num_envs)))
 
         # If randomizing, apply once immediately on startup before the fist sim step
         if self.randomize:
             self.apply_randomizations(self.randomization_params)
-        
-        self.obs_dict["is_first"] = True
 
     def _create_ground_plane(self):
         plane_params = gymapi.PlaneParams()
@@ -312,7 +346,7 @@ class ShadowHand(embodied.Env):
         lower = gymapi.Vec3(-spacing, -spacing, 0.0)
         upper = gymapi.Vec3(spacing, spacing, spacing)
 
-        asset_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../assets'))
+        asset_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../assets'))
         shadow_hand_asset_file = os.path.normpath("mjcf/open_ai_assets/hand/shadow_hand.xml")
 
         if "asset" in self.cfg["env"]:
@@ -548,7 +582,6 @@ class ShadowHand(embodied.Env):
         self.fingertip_pos = self.rigid_body_states[:, self.fingertip_handles][:, :, 0:3]
 
         # #Adding to dict
-        self.obs_dict["is_first"] = False
         # self.obs_dict["object_pose"] = self.root_state_tensor[self.object_indices, 0:7]
         # self.obs_dict["object_pos"] = self.root_state_tensor[self.object_indices, 0:3]
         # self.obs_dict["object_rot"] = self.root_state_tensor[self.object_indices, 3:7]
@@ -595,7 +628,7 @@ class ShadowHand(embodied.Env):
             self.obs_dict["object_pose"] = self.object_pose[:, 0:3]
             self.obs_dict["goal_rot"] = quat_mul(self.object_rot, quat_conjugate(self.goal_rot))
 
-            self.obs_dict["actions"] = normalize_action_torch(self.actions, self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits)
+            # self.obs_dict["actions"] = normalize_action_torch(self.actions, self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits)
 
         else:
             # 13*self.num_fingertips = 65
@@ -617,7 +650,7 @@ class ShadowHand(embodied.Env):
             self.obs_dict["goal_rot"] = self.goal_pose
             self.obs_dict["goal_pose"] = quat_mul(self.object_rot, quat_conjugate(self.goal_rot))
 
-            self.obs_dict["actions"] = normalize_action_torch(self.actions, self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits)
+            # self.obs_dict["actions"] = normalize_action_torch(self.actions, self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits)
 
     def compute_full_observations(self, no_vel=False):
         if no_vel:
@@ -641,7 +674,7 @@ class ShadowHand(embodied.Env):
 
             self.obs_dict["fingertip_pos"] = self.fingertip_pos.reshape(self.num_envs, 15)
 
-            self.obs_dict["actions"] = normalize_action_torch(self.actions, self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits)
+            # self.obs_dict["actions"] = normalize_action_torch(self.actions, self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits)
 
         else:
             self.obs_buf[:, 0:self.num_shadow_hand_dofs] = unscale(self.shadow_hand_dof_pos,
@@ -673,7 +706,7 @@ class ShadowHand(embodied.Env):
             
             self.obs_dict["fingertip_state"] = self.fingertip_state.reshape(self.num_envs, 65)
 
-            self.obs_dict["actions"] = normalize_action_torch(self.actions, self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits)
+            # self.obs_dict["actions"] = normalize_action_torch(self.actions, self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits)
 
 
     def compute_full_state(self, asymm_obs=False):
@@ -750,7 +783,7 @@ class ShadowHand(embodied.Env):
             self.obs_dict["fingertip_state"] = self.fingertip_state.reshape(self.num_envs, num_ft_states)
             self.obs_dict["fingertip_torque"] = self.force_torque_obs_scale * self.vec_sensor_tensor
 
-            self.obs_dict["actions"] = normalize_action_torch(self.actions, self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits)
+            # self.obs_dict["actions"] = normalize_action_torch(self.actions, self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits)
 
 
     def reset_target_pose(self, env_ids, apply_reset=False):
@@ -849,10 +882,13 @@ class ShadowHand(embodied.Env):
             self.reset_target_pose(goal_env_ids)
 
         if len(env_ids) > 0:
-            self.obs_dict["is_last"] = True
-            self.obs_dict["is_terminal"] = True
+            self.obs_dict["is_last"] = torch.tensor(True).type(torch.bool).to(self.device)
+            self.obs_dict["is_terminal"] = torch.tensor(True).type(torch.bool).to(self.device)
             self.reset_idx(env_ids, goal_env_ids)
-
+        else:
+            self.obs_dict["is_last"] = torch.tensor(False).type(torch.bool).to(self.device)
+            self.obs_dict["is_terminal"] = torch.tensor(False).type(torch.bool).to(self.device)
+    
         self.actions = actions.clone().to(self.device)
         if self.use_relative_control:
             targets = self.prev_targets[:, self.actuated_dof_indices] + self.shadow_hand_dof_speed_scale * self.dt * self.actions
@@ -919,6 +955,7 @@ class ShadowHand(embodied.Env):
                 'object_pose' : embodied.Space(np.float32, (3,)),
                 'goal_rot' : embodied.Space(np.float32, (3,)),
                 'actions' : embodied.Space(np.float32, (20,)),
+                'reward' : embodied.Space(np.float32),
                 'is_first': embodied.Space(bool),
                 'is_last': embodied.Space(bool),
                 'is_terminal': embodied.Space(bool)
@@ -956,7 +993,7 @@ class ShadowHand(embodied.Env):
         # The observation space must contain the keys action and reset. This
         # restriction may be lifted in the future.
         return {
-            'action': embodied.Space(np.int32, (), 0, self.actions.shape[1]),
+            'action': embodied.Space(np.float32, (20,), -1.0, 1.0),
             'reset': embodied.Space(bool)
         }
 
@@ -1024,24 +1061,6 @@ class ShadowHand(embodied.Env):
             self.num_envs, device=self.device, dtype=torch.long)
         self.extras = {}
 
-    def create_sim(self, compute_device: int, graphics_device: int, physics_engine, sim_params: gymapi.SimParams):
-        """Create an Isaac Gym sim object.
-
-        Args:
-            compute_device: ID of compute device to use.
-            graphics_device: ID of graphics device to use.
-            physics_engine: physics engine to use (`gymapi.SIM_PHYSX` or `gymapi.SIM_FLEX`)
-            sim_params: sim params to use.
-        Returns:
-            the Isaac Gym sim object.
-        """
-        sim = _create_sim_once(self.gym, compute_device, graphics_device, physics_engine, sim_params)
-        if sim is None:
-            print("*** Failed to create sim")
-            quit()
-
-        return sim
-
     def get_state(self):
         """Returns the state buffer of the environment (the privileged observations for asymmetric training)."""
         return torch.clamp(self.states_buf, -self.clip_obs, self.clip_obs).to(self.rl_device)
@@ -1055,6 +1074,9 @@ class ShadowHand(embodied.Env):
             Observations, rewards, resets, info
             Observations are dict of observations (currently only one member called 'obs')
         """
+        self.obs_dict["is_first"] = torch.tensor(actions['reset']).type(torch.bool).to(self.device)
+
+        actions = torch.tensor(actions['action'].astype(np.float32)).to(self.device)
 
         # randomize actions
         if self.dr_randomizations.get('actions', None):
@@ -1087,6 +1109,7 @@ class ShadowHand(embodied.Env):
         self.extras["time_outs"] = self.timeout_buf.to(self.rl_device)
 
         self.obs_dict["obs"] = torch.clamp(self.obs_buf, -self.clip_obs, self.clip_obs).to(self.rl_device)
+        self.obs_dict["reward"] = self.rew_buf
 
         # asymmetric actor-critic
         if self.num_states > 0:
@@ -1103,12 +1126,6 @@ class ShadowHand(embodied.Env):
         actions = torch.zeros([self.num_envs, self.num_actions], dtype=torch.float32, device=self.rl_device)
 
         return actions
-
-    def reset_idx(self, env_idx):
-        """Reset environment with indces in env_idx. 
-        Should be implemented in an environment class inherited from VecTask.
-        """  
-        pass
 
     def reset(self):
         """Is called only once when environment starts to provide the first observations.
@@ -1195,6 +1212,9 @@ class ShadowHand(embodied.Env):
         # assign general sim parameters
         sim_params.dt = config_sim["dt"]
         sim_params.num_client_threads = config_sim.get("num_client_threads", 0)
+        # print("Config:", config_sim)
+        # print(type(config_sim["use_gpu_pipeline"]), config_sim["use_gpu_pipeline"])
+
         sim_params.use_gpu_pipeline = config_sim["use_gpu_pipeline"]
         sim_params.substeps = config_sim.get("substeps", 2)
 
