@@ -16,6 +16,11 @@ def load_env(
         env = embodied.wrappers.ClipAction(env, name)
         env = embodied.wrappers.NormalizeAction(env, name)
     return env
+  
+  if task == 'shadow_hand':
+    from . import shadow_hand
+    env = shadow_hand.ShadowHand(rl_device=kwargs["rl_device"], sim_device=kwargs["sim_device"], graphics_device_id=kwargs["graphics_device_id"])
+    return env
 
   for index in range(amount):
     ctor = functools.partial(load_single_env, task, **kwargs)
